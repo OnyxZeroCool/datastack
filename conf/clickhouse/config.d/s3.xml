@@ -1,0 +1,15 @@
+<clickhouse>
+    <!--
+      Именованная коллекция для MinIO. Позволяет в SQL писать коротко:
+        SELECT * FROM s3(minio, filename='path/to/file.parquet', format='Parquet');
+        SELECT * FROM icebergS3(minio, filename='warehouse/db/table');
+      вместо передачи endpoint/ключей каждый раз.
+    -->
+    <named_collections>
+        <minio>
+            <url>http://minio:9000/warehouse/</url>
+            <access_key_id>minioadmin</access_key_id>
+            <secret_access_key>minioadmin</secret_access_key>
+        </minio>
+    </named_collections>
+</clickhouse>

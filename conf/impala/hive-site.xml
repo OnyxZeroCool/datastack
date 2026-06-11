@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<!--
+  Impala → тот же Hive Metastore, что и Spark, чтобы видеть одни Iceberg-таблицы.
+  Метастор — CDP-флейвор (apache/impala:*-impala_quickstart_hms): с ним работают
+  и data-запросы (SELECT/INSERT). С vanilla apache/hive Impala получала
+  accessType=NONE (IMPALA-10792) — не возвращайся на него.
+-->
+<configuration>
+  <property>
+    <name>hive.metastore.uris</name>
+    <value>thrift://hive-metastore:9083</value>
+  </property>
+  <property>
+    <name>metastore.warehouse.dir</name>
+    <value>s3a://warehouse/</value>
+  </property>
+</configuration>

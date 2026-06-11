@@ -1,0 +1,13 @@
+# jar'ы качаются через `make fetch-jars` — в репо им не место
+conf/hive/lib/*.jar
+conf/spark/jars/*.jar
+
+# рантайм
+logs/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# локальное
+.env.local
+.DS_Store

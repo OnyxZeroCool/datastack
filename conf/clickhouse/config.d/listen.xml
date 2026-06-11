@@ -1,0 +1,8 @@
+<clickhouse>
+    <!--
+      База config.xml слушает только loopback (::1 и 127.0.0.1), поэтому из
+      других контейнеров стека ClickHouse недоступен. Добавляем все интерфейсы.
+      listen_host аддитивен — этот элемент дополняет список из config.xml.
+    -->
+    <listen_host>0.0.0.0</listen_host>
+</clickhouse>

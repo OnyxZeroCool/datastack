@@ -1,0 +1,498 @@
+# ============================================================================
+# datastack — портабельный data-lakehouse для локальной разработки/обучения
+#
+#   Ядро (всегда):     minio, mc-init, metastore-db, hive-metastore,
+#                      spark-iceberg, greenplum
+#   Профиль clickhouse: clickhouse
+#   Профиль impala:     impala-statestore, impala-catalog, impalad
+#   Профиль airflow:    airflow-db, airflow-init, airflow-webserver, airflow-scheduler
+#   Профиль kafka:      kafka, kafka-ui
+#   Профиль nifi:       nifi
+#   Профиль superset:   superset-init, superset
+#
+#   Запуск ядра:        docker compose up -d
+#   Всё сразу:          docker compose --profile full up -d
+#   Подмножество:       docker compose --profile clickhouse --profile airflow up -d
+#
+# Профиль `full` навешан на каждый опциональный сервис дополнительно к его
+# собственному профилю, поэтому `--profile full` поднимает вообще всё.
+# ============================================================================
+
+x-platform: &platform ${PLATFORM:-linux/amd64}
+
+# Общие настройки для всех Airflow-сервисов
+x-airflow-common: &airflow-common
+  build: ./airflow                 # apache/airflow + JRE + клиенты движков (см. airflow/Dockerfile)
+  image: datastack-airflow:local
+  platform: *platform
+  profiles: ["airflow", "full"]
+  networks: [datastack]
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_PG_USER:-airflow}:${AIRFLOW_PG_PASSWORD:-airflow}@airflow-db:5432/${AIRFLOW_PG_DB:-airflow}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    # адреса движков и креды — DAG'ам как env
+    AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+    AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    AWS_REGION: us-east-1
+    S3_ENDPOINT: http://minio:9000
+    GP_DSN: postgresql://${GP_USER:-gpadmin}:${GP_PASSWORD:-gpadmin}@greenplum:5432/${GP_DB:-gpadmin}
+    CLICKHOUSE_HOST: clickhouse
+    CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+    CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+    IMPALA_HOST: impalad
+    HMS_HOST: hive-metastore
+  user: "${AIRFLOW_UID:-50000}:0"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./jobs:/opt/airflow/jobs
+    - ./logs:/opt/airflow/logs
+  depends_on:
+    airflow-db:
+      condition: service_healthy
+
+networks:
+  datastack:
+    name: datastack
+
+volumes:
+  minio-data:
+  hms-data:
+  greenplum-data:
+  clickhouse-data:
+  airflow-db-data:
+  spark-events:
+  kafka-data:
+  superset-data:
+  nifi-conf:
+  nifi-state:
+  nifi-database:
+  nifi-flowfile:
+  nifi-content:
+  nifi-provenance:
+
+services:
+
+  # ---------------------------------------------------------------- MinIO (S3)
+  minio:
+    image: minio/minio:${MINIO_TAG:-latest}
+    platform: *platform
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    networks: [datastack]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # Одноразовый сервис: создаёт бакет warehouse и выходит
+  mc-init:
+    image: minio/mc:latest
+    platform: *platform
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/scripts/create-buckets.sh"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      WAREHOUSE_BUCKET: ${WAREHOUSE_BUCKET:-warehouse}
+    volumes:
+      - ./init/minio:/scripts:ro
+    networks: [datastack]
+    restart: "no"
+
+  # ----------------------------------------- Hive Metastore (общий Iceberg-каталог)
+  # CDP-флейвор HMS из Impala quickstart (Hive 3.1.3000) — единственная публичная
+  # сборка, с которой data-запросы Impala по Iceberg работают. Vanilla apache/hive
+  # (и 4.0, и 3.1.3) возвращает Impala accessType=NONE — открытый баг IMPALA-10792.
+  # Spark/pyiceberg ходят сюда по обычному thrift — им флейвор безразличен.
+  # База — встроенный Derby в volume (как в апстримном docker/quickstart.yml).
+  hive-metastore:
+    image: apache/impala:${IMPALA_TAG:-4.4.1}-impala_quickstart_hms
+    platform: *platform
+    depends_on:
+      mc-init:
+        condition: service_completed_successfully
+    command: ["hms"]
+    environment:
+      # hadoop-aws + aws-sdk лежат в образе в tools/lib, но не в classpath.
+      # Этот флаг штатно добавляет их — иначе HMS не может создать БД на s3a://.
+      HADOOP_OPTIONAL_TOOLS: hadoop-aws
+    volumes:
+      # Один volume в два пути — трюк из апстримного quickstart.yml: mount на
+      # /var/lib/hive (есть в образе, владелец hive) инициализирует права,
+      # /user/hive/warehouse (нет в образе) их наследует. Иначе managed-путь
+      # будет root-owned и create_database упадёт.
+      - hms-data:/var/lib/hive
+      - hms-data:/user/hive/warehouse
+      - ./conf/hms-cdp:/opt/hive/conf:ro
+    ports:
+      - "${HMS_PORT:-9083}:9083"
+    networks: [datastack]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/localhost/9083'"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  # ------------------------------------------ Spark + Iceberg + Jupyter (ядро)
+  spark-iceberg:
+    image: tabulario/spark-iceberg:latest
+    platform: *platform
+    depends_on:
+      hive-metastore:
+        condition: service_started
+      mc-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      AWS_REGION: us-east-1
+    ports:
+      - "${SPARK_MASTER_UI_PORT:-8080}:8080"   # Spark Master UI
+      - "${SPARK_APP_UI_PORT:-4040}:4040"      # Spark Application UI (во время job)
+      - "${SPARK_HISTORY_PORT:-18080}:18080"   # Spark History Server
+      - "${JUPYTER_PORT:-8888}:8888"           # Jupyter
+    volumes:
+      - ./conf/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      # s3a-коннектор (в образе только iceberg-aws-bundle для S3FileIO, hadoop-aws нет)
+      - ./conf/spark/jars/hadoop-aws-3.3.4.jar:/opt/spark/jars/hadoop-aws-3.3.4.jar:ro
+      - ./conf/spark/jars/aws-java-sdk-bundle-1.12.262.jar:/opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar:ro
+      # postgres JDBC — чтобы джоба читала Greenplum (тот же jar, что у HMS)
+      - ./conf/hive/lib/postgresql-42.7.3.jar:/opt/spark/jars/postgresql-42.7.3.jar:ro
+      - ./notebooks:/home/iceberg/notebooks/notebooks
+      - ./jobs:/home/iceberg/jobs
+      - spark-events:/home/iceberg/spark-events
+    networks: [datastack]
+
+  # ------------------------------------------- Greenplum (MPP, вместо Teradata)
+  greenplum:
+    image: andruche/greenplum:${GREENPLUM_TAG:-7-4seg}
+    platform: *platform
+    environment:
+      # образ andruche/greenplum инициализирует кластер с gpadmin/gpadmin
+      POSTGRES_PASSWORD: ${GP_PASSWORD:-gpadmin}
+    ports:
+      - "${GP_PORT:-5432}:5432"
+    volumes:
+      - greenplum-data:/data
+      - ./init/greenplum:/init:ro
+    networks: [datastack]
+    healthcheck:
+      # бинарники GP не в дефолтном PATH — зовём по полному пути
+      test: ["CMD-SHELL", "/usr/local/gpdb/bin/pg_isready -h 127.0.0.1 -U ${GP_USER:-gpadmin} || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+
+  # ------------------------------------------------- ClickHouse (профиль clickhouse)
+  clickhouse:
+    image: clickhouse/clickhouse-server:${CLICKHOUSE_TAG:-25.3}
+    platform: *platform
+    profiles: ["clickhouse", "full"]
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${CLICKHOUSE_NATIVE_PORT:-9100}:9000"   # native сдвинут: 9000 занят MinIO
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./conf/clickhouse/config.d:/etc/clickhouse-server/config.d:ro
+      # один файл, не весь users.d: туда же пишет entrypoint образа
+      - ./conf/clickhouse/users.d/nc-access.xml:/etc/clickhouse-server/users.d/nc-access.xml:ro
+    networks: [datastack]
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------- Impala (профиль impala)
+  # Quickstart-топология: statestore + catalog + один coordinator/executor.
+  # ⚠️ Самый капризный узел стека (см. README → Известные грабли). Читает Iceberg через HMS.
+  impala-statestore:
+    image: apache/impala:${IMPALA_TAG:-4.4.1}-statestored
+    platform: *platform
+    profiles: ["impala", "full"]
+    command: ["-redirect_stdout_stderr=false", "-logtostderr", "-v=1"]
+    networks: [datastack]
+
+  impala-catalog:
+    image: apache/impala:${IMPALA_TAG:-4.4.1}-catalogd
+    platform: *platform
+    profiles: ["impala", "full"]
+    depends_on:
+      impala-statestore:
+        condition: service_started
+      hive-metastore:
+        condition: service_started
+    # event-polling включён (=1, как в апстримном quickstart): CDP-HMS отдаёт
+    # hive.metastore.dml.events=true, и catalogd сам подхватывает DDL/DML от
+    # Spark. INVALIDATE METADATA остаётся безвредной страховкой в ноутбуках/DAG.
+    command: >-
+      -redirect_stdout_stderr=false -logtostderr -v=1
+      -state_store_host=impala-statestore
+      -hms_event_polling_interval_s=1
+    volumes:
+      - ./conf/impala/core-site.xml:/opt/impala/conf/core-site.xml:ro
+      - ./conf/impala/hive-site.xml:/opt/impala/conf/hive-site.xml:ro
+    networks: [datastack]
+
+  impalad:
+    image: apache/impala:${IMPALA_TAG:-4.4.1}-impalad_coord_exec
+    platform: *platform
+    profiles: ["impala", "full"]
+    depends_on:
+      impala-statestore:
+        condition: service_started
+      impala-catalog:
+        condition: service_started
+    command: >-
+      -redirect_stdout_stderr=false -logtostderr -v=1
+      -state_store_host=impala-statestore
+      -catalog_service_host=impala-catalog
+      -mem_limit=4gb
+    ports:
+      - "${IMPALA_HS2_PORT:-21050}:21050"
+      - "${IMPALA_WEBUI_PORT:-25000}:25000"
+    volumes:
+      - ./conf/impala/core-site.xml:/opt/impala/conf/core-site.xml:ro
+      - ./conf/impala/hive-site.xml:/opt/impala/conf/hive-site.xml:ro
+    networks: [datastack]
+
+  # ------------------------------------------------ Python sandbox (профиль python)
+  # Образ со всеми клиентами движков. Точка входа: `make py` / `make py-run`.
+  python:
+    build: ./python
+    image: datastack-python:local
+    platform: *platform
+    profiles: ["python", "full"]
+    environment:
+      GP_DSN: postgresql://${GP_USER:-gpadmin}:${GP_PASSWORD:-gpadmin}@greenplum:5432/${GP_DB:-gpadmin}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      IMPALA_HOST: impalad
+      S3_ENDPOINT: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      AWS_REGION: us-east-1
+    volumes:
+      - ./scripts:/work/scripts
+      - ./jobs:/work/jobs
+    command: ["sleep", "infinity"]
+    networks: [datastack]
+
+  # ----------------------------------------------------- Kafka (профиль kafka)
+  # KRaft single-node: один процесс = и broker, и controller (Zookeeper не нужен).
+  # Два listener'а: PLAINTEXT для контейнеров (kafka:9092) и PLAINTEXT_HOST для
+  # хоста (localhost:29092) — иначе клиент с хоста получит advertised-адрес,
+  # который не сможет отрезолвить.
+  kafka:
+    image: apache/kafka:${KAFKA_TAG:-4.2.1}
+    platform: *platform
+    profiles: ["kafka", "full"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:${KAFKA_HOST_PORT:-29092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      # single-node: все факторы репликации = 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: -Xmx512m -Xms256m
+    ports:
+      - "${KAFKA_HOST_PORT:-29092}:29092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks: [datastack]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # Web-UI для Kafka: топики, сообщения, consumer-группы
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:${KAFKA_UI_TAG:-latest}
+    platform: *platform
+    profiles: ["kafka", "full"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: datastack
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      JAVA_OPTS: -Xmx256m
+    ports:
+      - "${KAFKA_UI_PORT:-8082}:8080"
+    networks: [datastack]
+
+  # ------------------------------------------------------- NiFi (профиль nifi)
+  # Визуальный data-flow. UI только по HTTPS (self-signed) — браузер ругнётся,
+  # это нормально. Логин/пароль из .env (пароль минимум 12 символов — иначе
+  # NiFi молча сгенерирует свой и в UI не пустит).
+  # ⚠️ Тяжёлый: ~1.3 ГБ RAM и несколько минут на старт под Rosetta.
+  nifi:
+    image: apache/nifi:${NIFI_TAG:-2.9.0}
+    platform: *platform
+    profiles: ["nifi", "full"]
+    environment:
+      SINGLE_USER_CREDENTIALS_USERNAME: ${NIFI_USER:-nifi}
+      SINGLE_USER_CREDENTIALS_PASSWORD: ${NIFI_PASSWORD:-nifinifinifi}
+      NIFI_WEB_HTTPS_PORT: "8443"
+      NIFI_WEB_PROXY_HOST: localhost:${NIFI_PORT:-8443}
+      NIFI_JVM_HEAP_INIT: 1g
+      NIFI_JVM_HEAP_MAX: 1g
+    ports:
+      - "${NIFI_PORT:-8443}:8443"
+    volumes:
+      - nifi-conf:/opt/nifi/nifi-current/conf
+      - nifi-state:/opt/nifi/nifi-current/state
+      - nifi-database:/opt/nifi/nifi-current/database_repository
+      - nifi-flowfile:/opt/nifi/nifi-current/flowfile_repository
+      - nifi-content:/opt/nifi/nifi-current/content_repository
+      - nifi-provenance:/opt/nifi/nifi-current/provenance_repository
+    networks: [datastack]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/localhost/8443'"]
+      interval: 30s
+      timeout: 5s
+      retries: 20
+      start_period: 180s
+
+  # ----------------------------------------------- Superset (профиль superset)
+  # BI поверх стека. Метадата — SQLite в volume (отдельная СУБД для учебного
+  # стенда лишняя). Драйверы CH/GP добавлены в superset/Dockerfile.
+  superset-init:
+    build: ./superset
+    image: datastack-superset:local
+    platform: *platform
+    profiles: ["superset", "full"]
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-datastack-not-a-secret}
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        superset db upgrade
+        superset fab create-admin \
+          --username "${SUPERSET_ADMIN_USER:-admin}" \
+          --password "${SUPERSET_ADMIN_PASSWORD:-admin}" \
+          --firstname admin --lastname admin --email admin@example.com || true
+        superset init
+        superset set-database-uri -d ClickHouse \
+          -u "clickhousedb://${CLICKHOUSE_USER:-default}:${CLICKHOUSE_PASSWORD:-clickhouse}@clickhouse:8123/default" || true
+        superset set-database-uri -d Greenplum \
+          -u "postgresql://${GP_USER:-gpadmin}:${GP_PASSWORD:-gpadmin}@greenplum:5432/${GP_DB:-gpadmin}" || true
+    volumes:
+      - superset-data:/app/superset_home
+    networks: [datastack]
+    restart: "no"
+
+  superset:
+    build: ./superset
+    image: datastack-superset:local
+    platform: *platform
+    profiles: ["superset", "full"]
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-datastack-not-a-secret}
+    ports:
+      - "${SUPERSET_PORT:-8089}:8088"
+    volumes:
+      - superset-data:/app/superset_home
+    networks: [datastack]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8088/health > /dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # --------------------------------------------------- Airflow (профиль airflow)
+  airflow-db:
+    image: postgres:${POSTGRES_TAG:-16}
+    platform: *platform
+    profiles: ["airflow", "full"]
+    environment:
+      POSTGRES_DB: ${AIRFLOW_PG_DB:-airflow}
+      POSTGRES_USER: ${AIRFLOW_PG_USER:-airflow}
+      POSTGRES_PASSWORD: ${AIRFLOW_PG_PASSWORD:-airflow}
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    networks: [datastack]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_PG_USER:-airflow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Одноразовый: миграция БД + создание admin-пользователя
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username "${AIRFLOW_ADMIN_USER:-airflow}" \
+          --password "${AIRFLOW_ADMIN_PASSWORD:-airflow}" \
+          --firstname admin --lastname admin --role Admin \
+          --email admin@example.com || true
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "${AIRFLOW_WEB_PORT:-8081}:8080"
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully

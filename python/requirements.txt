@@ -1,0 +1,9 @@
+# Клиенты ко всем движкам стека (ставятся в образ datastack-python)
+psycopg2-binary        # Greenplum (Postgres wire protocol)
+clickhouse-connect     # ClickHouse
+impyla                 # Impala (HS2); используем auth_mechanism=NOSASL
+pyiceberg[s3fs,pyarrow]  # читать Iceberg-таблицы из MinIO напрямую (без Spark)
+pandas
+boto3                  # S3/MinIO
+s3fs
+confluent-kafka        # Kafka producer/consumer

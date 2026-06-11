@@ -1,0 +1,9 @@
+<clickhouse>
+    <!-- Доступ default-пользователя к именованным коллекциям (s3/icebergS3 c
+         коллекцией minio из config.d/s3.xml). Без этого — ACCESS_DENIED. -->
+    <users>
+        <default>
+            <named_collection_control>1</named_collection_control>
+        </default>
+    </users>
+</clickhouse>
