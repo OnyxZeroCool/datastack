@@ -150,7 +150,9 @@ services:
 
   # ------------------------------------------ Spark + Iceberg + Jupyter (ядро)
   spark-iceberg:
-    image: tabulario/spark-iceberg:latest
+    # тег кодирует версии: Spark 3.5.5 + Iceberg 1.8.1 — от них зависят
+    # --packages в dags/lib/spark_task.py и ноутбуке 07
+    image: tabulario/spark-iceberg:${SPARK_ICEBERG_TAG:-3.5.5_1.8.1}
     platform: *platform
     depends_on:
       hive-metastore:
@@ -184,7 +186,7 @@ services:
   # и параллелизм между джобами. Entrypoint задан явно: дефолтный entrypoint
   # образа поднял бы ВТОРОЙ master + jupyter, а не worker.
   # spark-worker:
-  #   image: tabulario/spark-iceberg:latest
+  #   image: tabulario/spark-iceberg:${SPARK_ICEBERG_TAG:-3.5.5_1.8.1}
   #   platform: *platform
   #   depends_on:
   #     spark-iceberg:
