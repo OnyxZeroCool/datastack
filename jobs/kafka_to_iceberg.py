@@ -15,35 +15,22 @@ PySpark Structured Streaming: Kafka (sales_events) → Iceberg-таблица в
 (проверь `spark-submit --version`).
 """
 import os
+import sys
 
-from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json
 from pyspark.sql.types import DoubleType, IntegerType, StringType, StructField, StructType, TimestampType
+
+# общий get_spark лежит рядом в lib/ — путь добавляем от файла,
+# чтобы работало под обоими mount'ами (/home/iceberg/jobs и /opt/airflow/jobs)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib.session import get_spark
 
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "kafka:9092")
 TOPIC = os.environ.get("KAFKA_TOPIC", "sales_events")
 TABLE = "hive.analytics.sales_events"
 CHECKPOINT = "s3a://warehouse/_checkpoints/sales_events"
 
-S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "http://minio:9000")
-S3_KEY = os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
-S3_SECRET = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
-
-spark = (
-    SparkSession.builder.appName("kafka_to_iceberg")
-    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
-    .config("spark.sql.catalog.hive", "org.apache.iceberg.spark.SparkCatalog")
-    .config("spark.sql.catalog.hive.type", "hive")
-    .config("spark.sql.catalog.hive.uri", "thrift://hive-metastore:9083")
-    .config("spark.sql.catalog.hive.warehouse", "s3a://warehouse/")
-    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-    .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT)
-    .config("spark.hadoop.fs.s3a.access.key", S3_KEY)
-    .config("spark.hadoop.fs.s3a.secret.key", S3_SECRET)
-    .config("spark.hadoop.fs.s3a.path.style.access", "true")
-    .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
-    .getOrCreate()
-)
+spark = get_spark("kafka_to_iceberg")
 
 event_schema = StructType(
     [

@@ -13,34 +13,12 @@ from __future__ import annotations
 import os
 import pendulum
 from airflow.models.dag import DAG
-from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
-GP_DSN = os.environ.get("GP_DSN", "postgresql://gpadmin:gpadmin@greenplum:5432/gpadmin")
-SPARK_PACKAGES = ",".join([
-    "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.8.1",  # = версия в образе spark-iceberg
-    "org.apache.hadoop:hadoop-aws:3.3.4",
-    "org.postgresql:postgresql:42.7.3",
-])
+from lib.gp_seed import GP_DSN, seed_greenplum
+from lib.spark_task import spark_submit_task
+
 TOLERANCE = 0.01
-
-
-def seed_greenplum():
-    import psycopg2
-    conn = psycopg2.connect(GP_DSN)
-    conn.autocommit = True
-    with conn.cursor() as cur:
-        cur.execute("CREATE TABLE IF NOT EXISTS sales "
-                    "(id bigint, sale_date date, region text, product text, amount numeric(12,2)) "
-                    "DISTRIBUTED BY (id)")
-        cur.execute("SELECT count(*) FROM sales")
-        if cur.fetchone()[0] == 0:
-            cur.execute(
-                "INSERT INTO sales SELECT g, date '2025-01-01' + (g %% 180), "
-                "(ARRAY['EMEA','APAC','AMER','LATAM'])[1 + (g %% 4)], "
-                "(ARRAY['widget','gadget','gizmo','doohickey'])[1 + (g %% 4)], "
-                "round((random()*1000)::numeric, 2) FROM generate_series(1, 100000) g")
-        cur.execute("ANALYZE sales")
 
 
 def verify_across_engines():
@@ -90,13 +68,7 @@ with DAG(
 ) as dag:
 
     t1 = PythonOperator(task_id="seed_greenplum", python_callable=seed_greenplum)
-    t2 = BashOperator(
-        task_id="spark_etl",
-        bash_command=(
-            "spark-submit --master spark://spark-iceberg:7077 "
-            f"--packages {SPARK_PACKAGES} /opt/airflow/jobs/gp_to_iceberg.py"
-        ),
-    )
+    t2 = spark_submit_task("spark_etl", "gp_to_iceberg.py", packages="jdbc")
     t3 = PythonOperator(task_id="verify_across_engines", python_callable=verify_across_engines)
 
     t1 >> t2 >> t3

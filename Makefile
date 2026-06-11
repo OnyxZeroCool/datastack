@@ -14,7 +14,8 @@ include .env
 export
 
 .PHONY: help fetch-jars up up-full up-clickhouse up-impala up-airflow up-python up-kafka up-nifi up-superset down down-v ps logs \
-        gp-init psql-gp spark-sql spark-demo clickhouse-cli impala-shell py py-sh py-run urls validate
+        gp-init psql-gp spark-sql spark-demo clickhouse-cli impala-shell py py-sh py-run urls validate \
+        ddl-ch-up ddl-ch-down
 
 help: ## Показать список команд
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(firstword $(MAKEFILE_LIST)) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -82,6 +83,14 @@ spark-demo: ## Запустить ETL Greenplum→Iceberg внутри конт�
 
 clickhouse-cli: ## ClickHouse client
 	$(COMPOSE) exec clickhouse clickhouse-client --password $(CLICKHOUSE_PASSWORD)
+
+ddl-ch-up: ## Создать publish-слой analytics_mart в ClickHouse (идемпотентно)
+	$(COMPOSE) exec -T clickhouse clickhouse-client --password $(CLICKHOUSE_PASSWORD) --multiquery < ddl/clickhouse_up.sql
+	@echo "OK: analytics_mart создан"
+
+ddl-ch-down: ## Удалить publish-слой analytics_mart из ClickHouse
+	$(COMPOSE) exec -T clickhouse clickhouse-client --password $(CLICKHOUSE_PASSWORD) --multiquery < ddl/clickhouse_down.sql
+	@echo "OK: analytics_mart удалён"
 
 impala-shell: ## Impala shell (отдельный client-образ: в impalad самого шелла нет)
 	docker run --rm -it --network datastack apache/impala:$${IMPALA_TAG:-4.4.1}-impala_quickstart_client impala-shell -i impalad

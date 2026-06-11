@@ -178,6 +178,32 @@ services:
       - spark-events:/home/iceberg/spark-events
     networks: [datastack]
 
+  # Отдельный Spark-worker — раскомментируй при 16+ ГБ для Docker VM.
+  # Без него master в spark-iceberg исполняет джобы сам (локальные executor'ы) —
+  # для учёбы хватает; worker даёт честную картину «кластера» в Spark Master UI
+  # и параллелизм между джобами. Entrypoint задан явно: дефолтный entrypoint
+  # образа поднял бы ВТОРОЙ master + jupyter, а не worker.
+  # spark-worker:
+  #   image: tabulario/spark-iceberg:latest
+  #   platform: *platform
+  #   depends_on:
+  #     spark-iceberg:
+  #       condition: service_started
+  #   entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-iceberg:7077"]
+  #   environment:
+  #     AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+  #     AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+  #     AWS_REGION: us-east-1
+  #     SPARK_WORKER_MEMORY: 2g
+  #     SPARK_WORKER_CORES: 2
+  #   volumes:
+  #     - ./conf/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+  #     - ./conf/spark/jars/hadoop-aws-3.3.4.jar:/opt/spark/jars/hadoop-aws-3.3.4.jar:ro
+  #     - ./conf/spark/jars/aws-java-sdk-bundle-1.12.262.jar:/opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar:ro
+  #     - ./conf/hive/lib/postgresql-42.7.3.jar:/opt/spark/jars/postgresql-42.7.3.jar:ro
+  #     - ./jobs:/home/iceberg/jobs
+  #   networks: [datastack]
+
   # ------------------------------------------- Greenplum (MPP, вместо Teradata)
   greenplum:
     image: andruche/greenplum:${GREENPLUM_TAG:-7-4seg}
@@ -456,7 +482,7 @@ services:
       timeout: 5s
       retries: 10
 
-  # Одноразовый: миграция БД + создание admin-пользователя
+  # Одноразовый: миграция БД + создание admin-пользователя + пулы
   airflow-init:
     <<: *airflow-common
     entrypoint: /bin/bash
@@ -469,6 +495,8 @@ services:
           --password "${AIRFLOW_ADMIN_PASSWORD:-airflow}" \
           --firstname admin --lastname admin --role Admin \
           --email admin@example.com || true
+        # один spark-submit за раз: параллельные spark-джобы на этой машине = OOM
+        airflow pools set spark_pool 1 "single spark-submit at a time" || true
     restart: "no"
 
   airflow-webserver:

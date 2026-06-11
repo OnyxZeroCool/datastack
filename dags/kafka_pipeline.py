@@ -23,18 +23,13 @@ from datetime import datetime, timedelta
 
 import pendulum
 from airflow.models.dag import DAG
-from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
+
+from lib.spark_task import spark_submit_task
 
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "kafka:9092")
 TOPIC = "sales_events"
 BATCH_SIZE = 500
-
-SPARK_PACKAGES = ",".join([
-    "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.8.1",  # = версия в образе spark-iceberg
-    "org.apache.hadoop:hadoop-aws:3.3.4",
-    "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5",         # = версия Spark в образе
-])
 
 
 def produce_events():
@@ -100,15 +95,7 @@ with DAG(
         python_callable=produce_events,
     )
 
-    t2 = BashOperator(
-        task_id="spark_kafka_to_iceberg",
-        bash_command=(
-            "spark-submit "
-            "--master spark://spark-iceberg:7077 "
-            f"--packages {SPARK_PACKAGES} "
-            "/opt/airflow/jobs/kafka_to_iceberg.py"
-        ),
-    )
+    t2 = spark_submit_task("spark_kafka_to_iceberg", "kafka_to_iceberg.py", packages="kafka")
 
     t3 = PythonOperator(
         task_id="verify_counts",
