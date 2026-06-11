@@ -50,11 +50,11 @@ PUBLISH_DDL = [
     "CREATE DATABASE IF NOT EXISTS analytics_mart",
     """CREATE TABLE IF NOT EXISTS analytics_mart.sales_by_region_product_monthly (
         sale_month Date, _source String, region String, product String,
-        orders_cnt UInt64, total_amount Decimal(18,2), avg_amount Decimal(18,2)
+        orders_cnt UInt64, total_amount Decimal(18, 2), avg_amount Decimal(18, 2)
     ) ENGINE = MergeTree ORDER BY (sale_month, region, product)""",
     """CREATE TABLE IF NOT EXISTS analytics_mart.sales_monthly (
         sale_month Date, _source String, orders_cnt UInt64,
-        total_amount Decimal(18,2), regions_cnt UInt64, products_cnt UInt64
+        total_amount Decimal(18, 2), regions_cnt UInt64, products_cnt UInt64
     ) ENGINE = MergeTree ORDER BY (sale_month)""",
     """CREATE TABLE IF NOT EXISTS analytics_mart.sales_quality (
         _source String, month Date, rows_cnt UInt64, null_id_cnt UInt64,
